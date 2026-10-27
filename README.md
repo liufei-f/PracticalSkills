@@ -9,6 +9,7 @@
 | [collect-unknown-words](collect-unknown-words/SKILL.md) | 把明确想收藏的陌生英语单词或短语加入本地 vocab 词库；按需查看、删除及邮件复习。 |
 | [daily-llm-email-digest](daily-llm-email-digest/SKILL.md) | 创建每天检索 LLM 进展、解释概念并发送邮件的本地程序。 |
 | [pptx-speaker-notes](pptx-speaker-notes/SKILL.md) | 为已有 PPT 首次撰写逐页讲稿，或按用户更新的版本修订 Notes；核对内容、衔接、页面与动画。 |
+| [paper-reading-explainer](paper-reading-explainer/SKILL.md) | 仔细读论文，用中文人话讲清核心概念、真实与模拟数据、方法、结论及每张图；根据理解反馈调整讲解深度。 |
 
 ## 使用
 
