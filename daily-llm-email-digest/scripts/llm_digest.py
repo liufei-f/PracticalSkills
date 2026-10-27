@@ -9,12 +9,15 @@ import os
 import re
 import smtplib
 import sys
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html.parser import HTMLParser
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -142,32 +145,116 @@ def collect(now, seen):
     return unique[:8], errors
 
 
+class ArticleText(HTMLParser):
+    """提取网页正文段落，跳过脚本、导航和页脚。"""
+    SKIP = {"script", "style", "nav", "footer", "header", "aside", "noscript", "form"}
+
+    def __init__(self):
+        super().__init__()
+        self.depth, self.in_p, self.parts, self.buf = 0, False, [], []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self.SKIP:
+            self.depth += 1
+        elif tag in ("p", "li", "h2", "h3") and not self.depth:
+            self.in_p, self.buf = True, []
+
+    def handle_endtag(self, tag):
+        if tag in self.SKIP and self.depth:
+            self.depth -= 1
+        elif tag in ("p", "li", "h2", "h3") and self.in_p:
+            text = re.sub(r"\s+", " ", "".join(self.buf)).strip()
+            if len(text) > 40:
+                self.parts.append(text)
+            self.in_p = False
+
+    def handle_data(self, data):
+        if self.in_p and not self.depth:
+            self.buf.append(data)
+
+
+def read_article(item, limit=6000):
+    """抓取原文正文；arXiv 优先读 HTML 全文，抓不到时退回 RSS 摘要。"""
+    url = item["url"]
+    match = re.search(r"arxiv\.org/abs/([\w.]+?)(v\d+)?$", url)
+    candidates = [f"https://arxiv.org/html/{match.group(1)}"] if match else []
+    if "news.google.com" not in url:
+        candidates.append(url)
+    for candidate in candidates:
+        try:
+            parser = ArticleText()
+            parser.feed(fetch(candidate).decode("utf-8", "replace"))
+            text = " ".join(parser.parts)
+            if len(text) > 300:
+                return text[:limit], True
+        except Exception:
+            continue
+    return item["summary"][:limit], False
+
+
+def call_model(prompt, key, model, retries=3):
+    body = json.dumps({"model": model, "input": prompt, "max_output_tokens": 4000,
+                       "reasoning": {"effort": "low"},
+                       "text": {"format": {"type": "json_object"}}}).encode()
+    last = None
+    for attempt in range(retries):
+        try:
+            req = urllib.request.Request("https://api.openai.com/v1/responses", data=body,
+                                         headers={"Authorization": f"Bearer {key}",
+                                                  "Content-Type": "application/json", "User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=120) as response:
+                data = json.load(response)
+            output = "".join(part.get("text", "") for block in data.get("output", [])
+                             for part in block.get("content", []) if part.get("type") == "output_text")
+            return json.loads(output)
+        except Exception as exc:
+            last = exc
+            time.sleep(2 * (attempt + 1))
+    raise last
+
+
+def explain_one(i, item, key, model):
+    text, full = read_article(item)
+    material = {"source": item["source"], "title": item["title"],
+                "text_type": "原文正文" if full else "RSS 摘要", "text": text}
+    prompt = (
+        "你是谨慎的中文 LLM 研究简报编辑。阅读下面的材料，只根据材料写作，不补充未证实的事实。"
+        "输出一个 JSON 对象，键为 summary、evidence、concept。summary 是 3 至 5 句通俗中文总结："
+        "讲清做了什么、关键方法或发现、为什么值得关注。evidence 是一句话的信息限度或待验证点"
+        "（如预印本未经同行评审、仅有公司自述、只读到摘要）。concept 是材料中实际出现、读者可能不熟悉的"
+        "一个技术概念（不选产品、公司或模型名称），格式为 {\"name\": 中文名（英文）, \"explanation\": 一两句解释}；没有合适概念则为 null。"
+        "不要把论文预印本写成已验证结论，不许编造数字、发布日期或外部链接。\n材料："
+        + json.dumps(material, ensure_ascii=False)
+    )
+    result = call_model(prompt, key, model)
+    if not isinstance(result.get("summary"), str) or not re.search(r"[一-鿿]", result["summary"]):
+        raise ValueError("AI 返回缺少中文总结")
+    concept = result.get("concept")
+    if isinstance(concept, dict) and concept.get("name"):
+        concept["item_id"] = i
+    else:
+        concept = None
+    return {"id": i, "explanation": result["summary"], "evidence": str(result.get("evidence", ""))}, concept
+
+
 def ai_explain(items, key, model):
+    """逐条阅读原文并生成中文总结；单条失败只回退该条，不影响其他条目。"""
     if not key or not items:
         return None
-    payload = [{"id": i, "source": x["source"], "title": x["title"],
-                "summary": x["summary"][:900]} for i, x in enumerate(items)]
-    prompt = (
-        "你是谨慎的中文 LLM 研究简报编辑。只根据给定的标题和摘要写作，不补充未证实的事实。"
-        "输出一个 JSON 对象，只有 updates 和 concepts 两个键。updates 是数组，每项有 id、"
-        "explanation（1至2句通俗中文，讲清是什么和为什么值得关注）、evidence（信息限度或待验证点，简短）。"
-        "concepts 是最多3项数组，每项有 name、explanation、item_id。只选择材料中实际出现、"
-        "读者可能不熟悉的技术概念；没有合适概念可返回空数组。不要把论文预印本写成已验证结论。"
-        "不许编造数字、发布日期或外部链接。\n材料：" + json.dumps(payload, ensure_ascii=False)
-    )
-    body = json.dumps({"model": model, "input": prompt, "max_output_tokens": 3000,
-                       "text": {"format": {"type": "json_object"}}}).encode()
-    req = urllib.request.Request("https://api.openai.com/v1/responses", data=body,
-                                 headers={"Authorization": f"Bearer {key}",
-                                          "Content-Type": "application/json", "User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=90) as response:
-        data = json.load(response)
-    output = "".join(part.get("text", "") for block in data.get("output", [])
-                     for part in block.get("content", []) if part.get("type") == "output_text")
-    result = json.loads(output)
-    if not isinstance(result.get("updates"), list) or not isinstance(result.get("concepts"), list):
-        raise ValueError("AI 返回格式不完整")
-    return result
+    fallback = fallback_explain(items)
+    updates, concepts = list(fallback["updates"]), []
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(explain_one, i, item, key, model): i for i, item in enumerate(items)}
+        for future in as_completed(futures):
+            i = futures[future]
+            try:
+                updates[i], concept = future.result()
+                if concept:
+                    concepts.append(concept)
+            except Exception as exc:
+                print(f"第 {i} 条 AI 总结失败，使用原文摘要：{exc}", file=sys.stderr)
+    concepts.sort(key=lambda c: c["item_id"])
+    return {"updates": updates, "concepts": concepts[:3] or fallback["concepts"]}
 
 
 def fallback_explain(items):
